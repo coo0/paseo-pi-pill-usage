@@ -7,12 +7,13 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   snapshot: vi.fn(),
   calls: vi.fn(),
+  balance: vi.fn(),
   close: vi.fn(),
-  agent: { status: "idle", title: "统计 token" } as { status: string; title: string } | null,
+  agent: { status: "idle", title: "统计 token" } as { status: string; title: string; model?: string; persistence?: { sessionId: string } } | null,
 }));
 
 vi.mock("@getpaseo/plugin/client", () => ({
-  useRpc: (rpc: { name: string }) => (rpc.name === "pi-usage.snapshot" ? mocks.snapshot : mocks.calls),
+  useRpc: (rpc: { name: string }) => (rpc.name === "pi-usage.snapshot" ? mocks.snapshot : rpc.name === "pi-usage.balance" ? mocks.balance : mocks.calls),
   useAgent: () => mocks.agent,
 }));
 
@@ -133,6 +134,7 @@ beforeEach(() => {
   mocks.agent = { status: "idle", title: "统计 token" };
   mocks.snapshot.mockResolvedValue({ readAt: "2026-09-11T08:40:00.000Z", agents: [okSnapshot] });
   mocks.calls.mockResolvedValue(okCalls);
+  mocks.balance.mockResolvedValue({ balance: 222, unit: "CNY", total: 500 });
 });
 
 afterEach(() => {
@@ -147,13 +149,20 @@ test("renders cumulative totals, context and per-call detail", async () => {
   await flush();
 
   const text = visible();
+  expect(renderer.root.findAll((node) => (node.type as unknown as string) === "Text")
+    .map((node) => node.children.join(""))
+    .filter((label) => ["总 token", "上下文", "余额"].includes(label))
+    .slice(0, 3)).toEqual(["总 token", "上下文", "余额"]);
   expect(text).toContain("π Token 用量");
   // The subtitle is the session title, explicitly labelled so it reads as metadata.
   expect(text).toContain("会话：统计 token");
   // Hero numbers.
   expect(text).toContain("8.2M"); // total tokens
   expect(text).toContain("8,214,706");
-  expect(text).toContain("$0.421");
+  expect(text).toContain("￥222.00 / ￥500.00");
+  expect(text).toContain("44.4%");
+  expect(text).not.toContain("花费");
+  for (const cost of ["$0.421", "$0.400", "$0.020", "$0.004"]) expect(text).not.toContain(cost);
   expect(text).toContain("64%"); // context percent
   expect(text).toContain("168k / 262k");
   // Breakdown rows.
@@ -262,4 +271,126 @@ test("marks context unknown after a compaction like Pi does", async () => {
 
   const text = visible();
   expect(text).toContain("压缩后待更新");
+});
+
+
+function balanceCard() {
+  return renderer.root.find((node) => (node.type as unknown as string) === "View" && node.children.some((child) => typeof child !== "string" && (child.type as unknown as string) === "Text" && child.children.join("") === "余额"));
+}
+
+const balanceCardText = () => balanceCard().findAll((node) => (node.type as unknown as string) === "Text").map((node) => node.children.join("")).join(" ");
+const balanceBarWidths = () => balanceCard().findAll((node) => Array.isArray(node.props.style) && node.props.style.some((style: { width?: string }) => style?.width !== undefined))
+  .map((node) => node.props.style.find((style: { width?: string }) => style?.width !== undefined).width);
+
+test.each([[0, "0%"], [222, "44.4%"], [600, "100%"], [-10, "0%"]])("balance card clamps progress for balance %s", async (balance, width) => {
+  mocks.balance.mockResolvedValue({ balance, unit: "CNY", total: 500 });
+  await renderPopover();
+  await flush();
+  expect(balanceCardText()).toContain(`￥${balance.toFixed(2)} / ￥500.00`);
+  expect(balanceBarWidths()).toEqual([width]);
+});
+
+test.each([undefined, null, 0, -1, NaN, Infinity, "500"])("balance card keeps the balance with unknown total %s", async (total) => {
+  mocks.balance.mockResolvedValue({ balance: 222, unit: "USD", total });
+  await renderPopover();
+  await flush();
+  expect(balanceCardText()).toContain("$222.00 / ?");
+  expect(balanceBarWidths()).toEqual([]);
+});
+
+test.each(["loading", "failure"])("balance %s does not block usage", async (state) => {
+  if (state === "loading") mocks.balance.mockImplementation(() => new Promise(() => {}));
+  else mocks.balance.mockRejectedValue(new Error("balance unavailable"));
+  await renderPopover();
+  await flush();
+  expect(balanceCardText()).toContain("? / ?");
+  expect(balanceBarWidths()).toEqual([]);
+  expect(visible()).toContain("8.2M");
+  expect(renderer.root.findAll((node) => (node.type as unknown as string) === "Text").map((node) => node.children.join("")).join(" ")).toContain("最近 40 次 LLM 调用");
+});
+
+test.each(["loaded", "loading"])("refresh requests fresh usage and balance while balance is %s", async (state) => {
+  if (state === "loading") mocks.balance.mockImplementation(() => new Promise(() => {}));
+  await renderPopover();
+  await flush();
+  mocks.snapshot.mockClear();
+  mocks.calls.mockClear();
+  mocks.balance.mockClear().mockResolvedValue({ balance: 100, unit: "CNY", total: 500 });
+  await act(async () => {
+    renderer.root.find((node) => node.props.accessibilityLabel === "立即刷新 Pi token 用量").props.onPress();
+  });
+  await flush();
+  expect(mocks.snapshot).toHaveBeenCalledWith({ agentIds: ["agent-1"] });
+  expect(mocks.calls).toHaveBeenCalledWith({ agentId: "agent-1", limit: 40 });
+  expect(mocks.balance).toHaveBeenCalledWith({ agent: "agent-1", refresh: true });
+  expect(balanceCardText()).toContain("￥100.00 / ￥500.00");
+  expect(balanceBarWidths()).toEqual(["20%"]);
+});
+
+test("balance query isolates cached data when switching agents A to B to A", async () => {
+  await renderPopover();
+  await flush();
+  expect(balanceCardText()).toContain("￥222.00 / ￥500.00");
+
+  const agentBProps = { ...popoverProps, agentId: "agent-2" } as PluginButtonContentProps;
+  mocks.snapshot.mockResolvedValue({ agents: [{ ...okSnapshot, agentId: "agent-2" }] });
+  let finish!: (value: { balance: number; unit: string; total: number }) => void;
+  mocks.balance.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+  await act(async () => {
+    renderer.update(React.createElement(QueryClientProvider, { client: queryClient }, React.createElement(PiUsagePopover, agentBProps)));
+  });
+  await flush();
+  expect(balanceCardText()).toContain("? / ?");
+  expect(balanceCardText()).not.toContain("￥222.00");
+  expect(balanceBarWidths()).toEqual([]);
+  await act(async () => { finish({ balance: 333, unit: "CNY", total: 500 }); });
+  await flush();
+  expect(balanceCardText()).toContain("￥333.00 / ￥500.00");
+
+  mocks.snapshot.mockResolvedValue({ agents: [okSnapshot] });
+  mocks.balance.mockClear();
+  await act(async () => {
+    renderer.update(React.createElement(QueryClientProvider, { client: queryClient }, React.createElement(PiUsagePopover, popoverProps)));
+  });
+  expect(balanceCardText()).toContain("? / ?");
+  await flush();
+  expect(mocks.balance).toHaveBeenCalledWith({ agent: "agent-1", refresh: false });
+  expect(balanceCardText()).toContain("? / ?");
+  expect(balanceCardText()).not.toContain("￥222.00");
+  expect(balanceCardText()).not.toContain("￥333.00");
+  expect(balanceBarWidths()).toEqual([]);
+  expect(visible()).toContain("8.2M");
+  expect(renderer.root.findAll((node) => (node.type as unknown as string) === "Text").map((node) => node.children.join("")).join(" ")).toContain("最近 40 次 LLM 调用");
+  expect(visible()).not.toContain("花费");
+
+  await act(async () => { finish({ balance: 100, unit: "CNY", total: 500 }); });
+  await flush();
+  expect(balanceCardText()).toContain("￥100.00 / ￥500.00");
+  expect(balanceBarWidths()).toEqual(["20%"]);
+});
+
+test.each(["agent", "model", "session"])("balance query clears old data when %s changes", async (identity) => {
+  await renderPopover();
+  await flush();
+  expect(balanceCardText()).toContain("￥222.00");
+  let finish!: (value: { balance: number; unit: string; total: number }) => void;
+  mocks.balance.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+  if (identity === "agent") mocks.snapshot.mockResolvedValue({ agents: [{ ...okSnapshot, agentId: "agent-2" }] });
+  if (identity === "session") {
+    mocks.snapshot.mockResolvedValue({ agents: [{ ...okSnapshot, sessionId: "new-session" }] });
+    await act(async () => { await queryClient.refetchQueries({ queryKey: ["pi-usage", "snapshot"] }); });
+  } else {
+    if (identity === "model") mocks.agent = { status: "idle", title: "统计 token", model: "new/model" };
+    await act(async () => {
+      renderer.update(React.createElement(QueryClientProvider, { client: queryClient }, React.createElement(PiUsagePopover,
+        identity === "agent" ? { ...popoverProps, agentId: "agent-2" } as PluginButtonContentProps : popoverProps)));
+    });
+  }
+  await flush();
+  expect(balanceCardText()).toContain("? / ?");
+  expect(balanceCardText()).not.toContain("￥222.00");
+  await act(async () => { finish({ balance: 10, unit: "USD", total: 50 }); });
+  await flush();
+  expect(balanceCardText()).toContain("$10.00 / $50.00");
+  expect(balanceBarWidths()).toEqual(["20%"]);
 });

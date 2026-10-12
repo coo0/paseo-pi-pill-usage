@@ -1,11 +1,14 @@
 import type { PluginButtonContentProps, PluginHostProps } from "@getpaseo/plugin/client";
 import { useAgent, useRpc } from "@getpaseo/plugin/client";
-import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo, useRef } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
-import { formatCost, formatPercent, formatTokens, sessionCacheHitRate } from "../shared/format";
+import { formatPercent, formatTokens, sessionCacheHitRate } from "../shared/format";
 import type { CallUsage, ModelUsage, UsageSnapshot } from "../shared/usage";
 import { piUsageCallsRpc, piUsageSnapshotRpc } from "../shared/usage";
+
+import { piBalanceRpc, type PiBalance } from "../shared/balance";
+import { formatBalance } from "../shared/balanceFormat";
 
 const CALL_LIMIT = 40;
 
@@ -74,7 +77,10 @@ function TokenUsageView({
   const compact = layout.compact;
   const snapshotRpc = useRpc(piUsageSnapshotRpc);
   const callsRpc = useRpc(piUsageCallsRpc);
-  const agent = useAgent(agentId, ({ status, title }) => ({ status, title }));
+  const balanceRpc = useRpc(piBalanceRpc);
+  const queryClient = useQueryClient();
+  const refreshBalance = useRef(false);
+  const agent = useAgent(agentId, ({ status, title, provider, model }) => ({ status, title, provider, model }));
   const styles = useMemo(() => createStyles(colors, compact), [colors, compact]);
 
   const intervalMs = agent?.status === "running" ? 2000 : 10_000;
@@ -92,6 +98,24 @@ function TokenUsageView({
   const callsQuery = useQuery({
     queryKey: ["pi-usage", "calls", agentId, CALL_LIMIT],
     queryFn: () => callsRpc({ agentId, limit: CALL_LIMIT }),
+    refetchInterval: intervalMs,
+    staleTime: 1000,
+  });
+
+  const balanceIdentity = [agentId, agent?.provider, agent?.model, snapshotQuery.data?.sessionId, snapshotQuery.data?.model];
+  const balanceIdentityRef = useRef({ fields: balanceIdentity, generation: 0 });
+  if (balanceIdentity.some((field, index) => !Object.is(field, balanceIdentityRef.current.fields[index]))) {
+    balanceIdentityRef.current = { fields: balanceIdentity, generation: balanceIdentityRef.current.generation + 1 };
+  }
+  // Returning to a previous identity must fetch again instead of reusing its cached balance.
+  const balanceQueryKey = ["pi-usage", "balance", ...balanceIdentity, balanceIdentityRef.current.generation];
+  const balanceQuery = useQuery({
+    queryKey: balanceQueryKey,
+    queryFn: () => {
+      const refresh = refreshBalance.current;
+      refreshBalance.current = false;
+      return balanceRpc({ agent: agentId, refresh });
+    },
     refetchInterval: intervalMs,
     staleTime: 1000,
   });
@@ -118,6 +142,10 @@ function TokenUsageView({
             onPress={() => {
               void snapshotQuery.refetch();
               void callsQuery.refetch();
+              void queryClient.cancelQueries({ queryKey: balanceQueryKey, exact: true }).then(() => {
+                refreshBalance.current = true;
+                return balanceQuery.refetch();
+              });
             }}
           >
             <Text style={styles.refreshText}>刷新</Text>
@@ -137,7 +165,7 @@ function TokenUsageView({
             {snapshotQuery.isError ? `读取失败：${describe(snapshotQuery.error)}` : "正在读取 Pi 会话…"}
           </Text>
         ) : (
-          <SnapshotBody snapshot={snapshot} styles={styles} colors={colors} />
+          <SnapshotBody snapshot={snapshot} balance={balanceQuery.isError ? null : balanceQuery.data ?? null} styles={styles} colors={colors} />
         )}
 
         {snapshot?.status === "ok" && calls?.perModel.length ? (
@@ -172,7 +200,7 @@ function TokenUsageView({
   );
 }
 
-function SnapshotBody({ snapshot, styles, colors }: { snapshot: UsageSnapshot; styles: Styles; colors: ThemeColors }) {
+function SnapshotBody({ snapshot, balance, styles, colors }: { snapshot: UsageSnapshot; balance: PiBalance | null; styles: Styles; colors: ThemeColors }) {
   if (snapshot.status === "not_pi") {
     return <Text style={styles.muted}>该 agent 的 provider 是 {snapshot.provider ?? "未知"}，本插件只统计 Pi 会话。</Text>;
   }
@@ -190,12 +218,17 @@ function SnapshotBody({ snapshot, styles, colors }: { snapshot: UsageSnapshot; s
     ? `压缩后待更新 · 已用 ${formatTokens(snapshot.contextUsedTokens)}`
     : `${formatTokens(snapshot.contextUsedTokens)}${snapshot.contextWindowTokens ? ` / ${formatTokens(snapshot.contextWindowTokens)}` : ""}`;
   const sessionRate = sessionCacheHitRate(snapshot.totals);
+  const balanceText = formatBalance(balance) ?? "?";
+  const total = balance?.total;
+  const validTotal = typeof total === "number" && Number.isFinite(total) && total > 0;
+  const totalText = validTotal ? formatBalance({ balance: total, unit: balance?.unit ?? null }) ?? "?" : "?";
+  const remainingPercent = validTotal && balance?.balance != null && Number.isFinite(balance.balance)
+    ? Math.max(0, Math.min(1, balance.balance / total)) * 100 : null;
 
   return (
     <>
       <View style={styles.cardRow}>
         <StatCard styles={styles} label="总 token" value={formatTokens(snapshot.totalTokens)} detail={groupDigits(snapshot.totalTokens)} />
-        <StatCard styles={styles} label="花费" value={formatCost(snapshot.totals.cost)} detail={`压缩 ${snapshot.compactions} 次`} />
         <StatCard
           styles={styles}
           label="上下文"
@@ -203,6 +236,8 @@ function SnapshotBody({ snapshot, styles, colors }: { snapshot: UsageSnapshot; s
           detail={snapshot.contextWindowTokens || snapshot.contextUsedTokens ? contextDetail : "窗口未知"}
           bar={percent === null ? undefined : { percent, color: barColor }}
         />
+        <StatCard styles={styles} label="余额" value={balanceText} detail={`${balanceText} / ${totalText}`}
+          bar={remainingPercent === null ? undefined : { percent: remainingPercent, color: colors.accent }} />
       </View>
 
       <View style={styles.section}>
@@ -239,6 +274,7 @@ function SnapshotBody({ snapshot, styles, colors }: { snapshot: UsageSnapshot; s
           value={snapshot.model ?? "—"}
           detail={snapshot.thinkingLevel ? `thinking ${snapshot.thinkingLevel}` : undefined}
         />
+        <Row styles={styles} label="压缩" value={`压缩 ${snapshot.compactions} 次`} />
         <Row styles={styles} label="LLM 调用" value={groupDigits(snapshot.calls)} detail={`用户轮次 ${groupDigits(snapshot.userTurns)}`} />
         <Row styles={styles} label="开始" value={formatTime(snapshot.startedAt)} detail={`最后活动 ${formatTime(snapshot.lastActivityAt)}`} />
         {snapshot.sessionId ? <Row styles={styles} label="Session" value={snapshot.sessionId} /> : null}
@@ -252,7 +288,7 @@ function PerModelList({ items, styles }: { items: ModelUsage[]; styles: Styles }
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>按模型拆分</Text>
       {items.map((item) => (
-        <Row key={item.key} styles={styles} label={item.key} value={formatTokens(item.tokens)} detail={formatCost(item.cost)} />
+        <Row key={item.key} styles={styles} label={item.key} value={formatTokens(item.tokens)} />
       ))}
     </View>
   );
@@ -291,7 +327,6 @@ function CallsTable({
           <Text style={styles.callNumber}>↑{formatTokens(call.input)}</Text>
           <Text style={styles.callNumber}>↓{formatTokens(call.output)}</Text>
           {narrowColumns ? null : <Text style={styles.callNumber}>R{formatTokens(call.cacheRead)}</Text>}
-          <Text style={styles.callNumber}>{formatCost(call.cost)}</Text>
           {narrowColumns ? null : <Text style={styles.callNumber}>{formatTokens(call.contextTokens)} ctx</Text>}
         </View>
       ))}
