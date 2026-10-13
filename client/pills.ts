@@ -1,9 +1,12 @@
+import { Dimensions } from "react-native";
 import type { PluginButtonRegistration, PluginClientContext } from "@getpaseo/plugin/client";
 import { buildPillTooltip, formatPercent } from "../shared/format";
 import { PI_USAGE_PANEL_ID, piUsageSnapshotRpc, type UsageSnapshot } from "../shared/usage";
-import { piBalanceRpc, type PiBalance } from "../shared/balance";
+import type { PiBalance } from "../shared/balance";
 import { formatBalance } from "../shared/balanceFormat";
 import { PiUsagePopover } from "./panel";
+import { createPillBalanceDiagnostic } from "./pillBalanceDiagnostics";
+import { createPillBalanceIcon } from "./pillBalanceIcon";
 
 /**
  * Per-agent composer pill showing balance and context window occupancy.
@@ -14,6 +17,7 @@ import { PiUsagePopover } from "./panel";
  */
 
 const FAST_INTERVAL_MS = 2500;
+const RPC_TIMEOUT_MS = 12_000;
 const HOT_WINDOW_MS = 2 * 60_000;
 const BATCH_SIZE = 40;
 const MAX_POLLED_PER_TICK = 120;
@@ -34,12 +38,11 @@ interface TrackedAgent {
   registration: PluginButtonRegistration;
   snapshot: UsageSnapshot | null;
   balance: PiBalance | null;
-  balancePending: boolean;
-  balanceAt: number;
+  balanceIcon: ReturnType<typeof createPillBalanceIcon>;
   sessionId: string | null;
   model: string | null;
-  balanceAwaitingSnapshot: boolean;
-  balanceEpoch: number;
+  snapshotToken: symbol | null;
+  diagnostic: ReturnType<typeof createPillBalanceDiagnostic>;
 }
 
 interface AgentLike {
@@ -69,7 +72,12 @@ export function startUsagePills(client: PluginClientContext): () => void {
   const tracked = new Map<string, TrackedAgent>();
   let stopped = false;
   let inFlight = false;
+  let cancelSnapshot: (() => void) | null = null;
+  let snapshotDeadline: number | null = null;
+  let snapshotRequestToken: symbol | null = null;
+  let snapshotAgents = new Set<TrackedAgent>();
   let lastErrorLog = 0;
+  let compact = Dimensions.get("window").width < 600;
 
   function labelFor(snapshot: UsageSnapshot, balance: string | null): string {
     const percent = snapshot.status === "ok" && !snapshot.contextStale ? snapshot.contextPercent : null;
@@ -84,6 +92,12 @@ export function startUsagePills(client: PluginClientContext): () => void {
     });
   }
 
+  function cancelSnapshotFor(agent: TrackedAgent): void {
+    if (!snapshotAgents.has(agent)) return;
+    for (const member of snapshotAgents) member.snapshotToken = null;
+    cancelSnapshot?.();
+  }
+
   function track(agent: AgentLike): void {
     if (stopped) return;
     const workspaceId = agent.workspaceId ?? null;
@@ -92,8 +106,11 @@ export function startUsagePills(client: PluginClientContext): () => void {
 
     if (!eligible) {
       if (existing) {
+        cancelSnapshotFor(existing);
+        existing.balanceIcon.dispose();
         existing.registration.remove();
         tracked.delete(agent.id);
+        existing.diagnostic.dispose();
       }
       return;
     }
@@ -105,13 +122,12 @@ export function startUsagePills(client: PluginClientContext): () => void {
 
     if (existing) {
       if (existing.sessionId !== sessionId || existing.model !== model) {
+        cancelSnapshotFor(existing);
         existing.sessionId = sessionId;
         existing.model = model;
-        existing.balanceEpoch++;
+        existing.snapshotToken = null;
         existing.balance = null;
-        existing.balanceAt = 0;
-        existing.balancePending = false;
-        existing.balanceAwaitingSnapshot = true;
+        existing.balanceIcon.setIdentity({ agentId: existing.id, provider: agent.provider, sessionId, model });
         existing.snapshot = null;
         existing.dirty = true;
         render(existing);
@@ -124,14 +140,26 @@ export function startUsagePills(client: PluginClientContext): () => void {
       return;
     }
 
+    const diagnostic = createPillBalanceDiagnostic(agent.id);
+    const balanceIcon = createPillBalanceIcon(
+      { agentId: agent.id, provider: agent.provider, sessionId, model },
+      (value, state) => {
+        const current = tracked.get(agent.id);
+        if (stopped || current?.balanceIcon !== balanceIcon) return;
+        current.balance = value;
+        diagnostic.publish(state, formatBalance(value) !== null);
+        render(current);
+      },
+      diagnostic,
+    );
     const registration = client.addComposerPill({
       id: PI_USAGE_PANEL_ID,
       workspaceId: workspaceId as string,
       agentId: agent.id,
       button: {
         title: "Pi token 用量",
-        icon: "Gauge",
-        label: "— ?%",
+        icon: balanceIcon.Icon,
+        label: compact ? "—" : "— ?%",
         behavior: {
           kind: "popover",
           Content: PiUsagePopover,
@@ -148,16 +176,20 @@ export function startUsagePills(client: PluginClientContext): () => void {
       label: null,
       tooltip: null,
       registration,
-      sessionId, model, balanceAwaitingSnapshot: false,
-      snapshot: null, balance: null, balancePending: false, balanceAt: 0, balanceEpoch: 0,
+      sessionId, model,
+      diagnostic, balanceIcon,
+      snapshot: null, balance: null, snapshotToken: null,
     });
   }
 
   function forget(agentId: string): void {
     const existing = tracked.get(agentId);
     if (!existing) return;
+    cancelSnapshotFor(existing);
+    existing.balanceIcon.dispose();
     existing.registration.remove();
     tracked.delete(agentId);
+    existing.diagnostic.dispose();
   }
 
   /**
@@ -176,7 +208,9 @@ export function startUsagePills(client: PluginClientContext): () => void {
 
   function render(agent: TrackedAgent): void {
     const balance = formatBalance(agent.balance);
-    const label = agent.snapshot ? labelFor(agent.snapshot, balance) : "— ?%";
+    const label = compact
+      ? balance?.replace(/^￥/, "¥") ?? "—"
+      : agent.snapshot ? labelFor(agent.snapshot, balance) : `${balance?.replace(/^￥/, "¥") ?? "—"} ?%`;
     const tooltip = (agent.snapshot ? tooltipFor(agent.snapshot) : "Pi token 用量") + (balance === null ? "" : ` · 余额 ${balance}`);
     if (label === agent.label && tooltip === agent.tooltip) return;
     agent.label = label;
@@ -184,43 +218,49 @@ export function startUsagePills(client: PluginClientContext): () => void {
     agent.registration.update({ label, title: tooltip });
   }
 
-  function applySnapshots(agents: readonly UsageSnapshot[], requests: Map<string, { agent: TrackedAgent; epoch: number }>): void {
+  function applySnapshots(agents: readonly UsageSnapshot[], requests: Map<string, { agent: TrackedAgent; token: symbol }>): void {
     if (stopped) return;
     for (const snapshot of agents) {
       const agent = tracked.get(snapshot.agentId);
       const request = requests.get(snapshot.agentId);
-      if (!agent || request?.agent !== agent || request.epoch !== agent.balanceEpoch) continue;
+      if (!agent || request?.agent !== agent || request.token !== agent.snapshotToken) continue;
       const previous = agent.snapshot;
       if (previous && (previous.sessionId !== snapshot.sessionId || previous.model !== snapshot.model || previous.provider !== snapshot.provider)) {
-        agent.balanceEpoch++;
         agent.balance = null;
-        agent.balanceAt = 0;
-        agent.balancePending = false;
       }
+      agent.balanceIcon.setIdentity({ agentId: agent.id, provider: snapshot.provider, sessionId: snapshot.sessionId, model: snapshot.model });
       agent.snapshot = snapshot;
-      agent.balanceAwaitingSnapshot = false;
       if (snapshot.status !== "error") agent.dirty = false;
       render(agent);
     }
   }
 
-  function pollBalance(): void {
-    if (stopped) return;
-    for (const agent of tracked.values()) {
-      if (!agent.snapshot || agent.balanceAwaitingSnapshot || agent.balancePending || (agent.balanceAt !== 0 && Date.now() - agent.balanceAt < 15_000)) continue;
-      const epoch = agent.balanceEpoch;
-      agent.balancePending = true;
-      void client.rpc(piBalanceRpc, { agent: agent.id, refresh: false }).then(value => {
-        if (stopped || tracked.get(agent.id) !== agent || agent.balanceEpoch !== epoch) return;
-        agent.balance = value;
-        render(agent);
-      }).catch(() => {
-        if (stopped || tracked.get(agent.id) !== agent || agent.balanceEpoch !== epoch) return;
-        agent.balance = null;
-        render(agent);
-      }).finally(() => {
-        if (agent.balanceEpoch === epoch) { agent.balancePending = false; agent.balanceAt = Date.now(); }
-      });
+  async function requestSnapshots(agentIds: string[]) {
+    const token = Symbol();
+    snapshotRequestToken = token;
+    snapshotDeadline = Date.now() + RPC_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeout = new Promise<never>((_, reject) => {
+      cancelSnapshot = () => {
+        if (snapshotRequestToken !== token || snapshotDeadline === null) return;
+        snapshotDeadline = null;
+        for (const agent of snapshotAgents) agent.snapshotToken = null;
+        if (timer !== null) clearTimeout(timer);
+        reject(new Error("snapshot request expired"));
+      };
+      timer = setTimeout(cancelSnapshot, RPC_TIMEOUT_MS);
+    });
+    try {
+      // The race handles late rejections; only the winning response reaches applySnapshots.
+      return await Promise.race([client.rpc(piUsageSnapshotRpc, { agentIds }), timeout]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+      if (snapshotRequestToken === token) {
+        snapshotRequestToken = null;
+        snapshotDeadline = null;
+        cancelSnapshot = null;
+        snapshotAgents.clear();
+      }
     }
   }
 
@@ -233,16 +273,22 @@ export function startUsagePills(client: PluginClientContext): () => void {
     try {
       for (let i = 0; i < agentIds.length && !stopped; i += BATCH_SIZE) {
         const batch = agentIds.slice(i, i + BATCH_SIZE);
-        const requests = new Map<string, { agent: TrackedAgent; epoch: number }>();
+        const requests = new Map<string, { agent: TrackedAgent; token: symbol }>();
         for (const id of batch) {
           const agent = tracked.get(id);
-          if (agent) requests.set(id, { agent, epoch: agent.balanceEpoch });
+          if (agent) {
+            const token = Symbol();
+            agent.snapshotToken = token;
+            requests.set(id, { agent, token });
+          }
         }
-        const result = await client.rpc(piUsageSnapshotRpc, { agentIds: batch });
+        snapshotAgents = new Set([...requests.values()].map(request => request.agent));
+        const snapshotRequest = requestSnapshots(batch);
+        const result = await snapshotRequest;
         applySnapshots(result.agents, requests);
-        pollBalance();
       }
     } catch (error) {
+      if (stopped) return;
       const now = Date.now();
       if (now - lastErrorLog > ERROR_LOG_COOLDOWN_MS) {
         lastErrorLog = now;
@@ -252,6 +298,12 @@ export function startUsagePills(client: PluginClientContext): () => void {
       inFlight = false;
     }
   }
+
+  const dimensionsSubscription = Dimensions.addEventListener("change", ({ window }) => {
+    if (stopped) return;
+    compact = window.width < 600;
+    for (const agent of tracked.values()) render(agent);
+  });
 
   const unsubscribe = client.paseo.agents.subscribe((update) => {
     if (update.kind === "upsert") track(update.agent);
@@ -286,16 +338,24 @@ export function startUsagePills(client: PluginClientContext): () => void {
   })();
 
   const timer = setInterval(() => {
+    // Wall-clock deadlines recover stalled timeouts, including after background resume.
+    const now = Date.now();
+    if (snapshotDeadline !== null && now >= snapshotDeadline) cancelSnapshot?.();
     void tick();
-    pollBalance();
   }, FAST_INTERVAL_MS);
 
   return () => {
     stopped = true;
+    cancelSnapshot?.();
     clearInterval(timer);
+    dimensionsSubscription.remove();
     unsubscribe();
     releaseDirectory?.();
-    for (const agent of tracked.values()) agent.registration.remove();
+    for (const agent of tracked.values()) {
+      agent.balanceIcon.dispose();
+      agent.registration.remove();
+      agent.diagnostic.dispose();
+    }
     tracked.clear();
   };
 }

@@ -24,18 +24,17 @@ paseo plugin ls
 
 ## 展示形式
 
-- **Composer pill**：Pi agent 输入框轨道栏显示 Gauge 图标、账户余额和上下文占比，例如 `$12.34 45%` 或 `¥12.34 45%`。余额保留两位小数，USD 使用 `$`，RMB / CNY 使用 `¥`；零余额也显示为 `$0.00` / `¥0.00`。余额未知显示 `—`，上下文未知或压缩后待更新显示 `?%`。
+- **Composer pill**：保留在输入框上方原有的 composer track，由宿主负责确切排布，不承诺所有设备都把各元素固定在同一行。视口宽度小于 600px 时显示余额；宽屏显示余额和上下文百分比。余额保留两位小数，USD 使用 `$`，RMB / CNY 使用 `¥`；零余额也显示为 `$0.00` / `¥0.00`。余额未知显示 `—`，上下文未知或压缩后待更新显示 `?%`。
 - **悬停 tooltip**：保留输入、输出、缓存命中率、会话花费（有值时）、上下文等用量摘要，并追加可用的账户余额。
-- **点击 pill 打开弹窗（popover）**：弹窗锚定在 pill 上，头部有「刷新」和「关闭」按钮，点击外部也可关闭；副标题显示「会话：」及会话标题。
-  - 顶部卡片依次为 **总 token → 上下文 → 余额**。
-  - 上下文卡片显示占比、已用量与窗口大小，并展示进度条：超过 70% 为黄色，超过 90% 为红色。
-  - 余额卡片大字显示当前余额，小字显示「余额 / 总额」，有有效总额时显示剩余比例进度条（余额除以总额，限制在 0%–100%）。余额或总额未知时对应位置显示 `?`；无有效总额时不显示剩余比例进度条。RMB / CNY 在卡片中使用 `￥`。
+- **点击 pill 打开弹窗（popover）**：弹窗锚定在 pill 上，头部有「刷新」和「关闭」按钮，点击外部也可关闭；副标题显示「会话：」及会话标题。顶部显示总 token 数字及完整整数值，下方为上下文和余额状态区及细进度条；不使用卡片边框，所有信息直接展开，不折叠，也不改变宿主外框宽度。
+  - 上下文区域显示占比、已用量与窗口大小；进度条超过 70% 为黄色，超过 90% 为红色。
+  - 余额区域显示当前余额与「余额 / 总额」；有有效总额时显示剩余比例进度条（余额除以总额，限制在 0%–100%）。余额或总额未知时对应位置显示 `?`；无有效总额时不显示剩余比例进度条。RMB / CNY 在弹窗中使用 `￥`。
   - token 明细保留总 token 合计公式、输入、输出、缓存读、缓存写、思考，以及最近调用和全会话缓存命中率。
   - 会话信息包括模型、thinking level、LLM 调用数、用户轮次、压缩次数、开始与最后活动时间、session id。
   - 按模型拆分显示 token 用量；最近 40 次 LLM 调用按新到旧展示时间、模型和 token 明细，窄列下隐藏 R / ctx 列。这两处均不显示花费。
   - 底部显示 session 文件路径与大小。
 
-账户余额来自余额接口，不是从会话花费中扣算出来的；卡片中的总额也来自接口，不由插件推算。
+账户余额来自余额接口，不是从会话花费中扣算出来的；弹窗中的总额也来自接口，不由插件推算。
 
 ## 余额配置与查询
 
@@ -104,10 +103,10 @@ paseo plugin ls
 
 ## 刷新策略
 
-- pill 用量：客户端每 2.5s 发起批量 RPC（`pi-usage.snapshot`，单批最多 40 个 agent，每轮最多 120 个）。运行中、初始化中或 2 分钟内活跃过的 agent 每轮刷新；安静的 agent 在 Paseo 报告状态或活动时间变化时重新读取。
-- pill 余额：有用量快照后查询 `pi-usage.balance`，客户端查询间隔至少 15s；不依赖安静 agent 的 token 文件重新读取。
-- 弹窗：运行中每 2s、空闲每 10s 刷新；「刷新」按钮重新获取用量、调用明细和余额，余额请求带 `refresh: true` 绕过服务端已完成的缓存。
-- 余额服务：默认缓存 15s（包括不可用结果），请求默认 8s 超时；同一 agent 当前会话 / 模型的并发请求共用正在进行的查询，手动刷新也会复用在途请求。会话或模型切换后会清除旧余额，并通过服务端取消和客户端结果校验抑制旧结果；归档时清理余额状态。
+- pill 用量：客户端每 2.5s 发起批量 RPC（`pi-usage.snapshot`，单批最多 40 个 agent，每轮最多 120 个）。运行中、初始化中或 2 分钟内活跃过的 agent 每轮刷新；安静的 agent 在 Paseo 报告状态或活动时间变化时重新读取。用量请求有独立的 12s 超时，`interval` 轮询作为兜底，超时后仍可由下一轮刷新。
+- pill 余额：余额查询使用 custom Icon 的 `useRpc` 并由宿主 TanStack Query 管理，查询间隔约 15s；需要保持 Icon 可见挂载，多个 Icon 的请求会去重。不依赖安静 agent 的 token 文件重新读取；pill 使用独立缓存，不保证与弹窗即时同步。
+- 弹窗：运行中每 2s、空闲每 10s 刷新；「刷新」按钮同时重新获取用量、调用明细和余额，余额请求带 `refresh: true` 绕过服务端已完成的缓存。
+- 余额服务：默认缓存 15s（包括不可用结果）。余额组件没有强制的 12s 客户端超时，供应商长期未返回时仍可能保持 pending。查询按 identity 区分，registration dispose epoch 隔离旧响应；会话或模型切换后会清除旧余额，并通过服务端取消和客户端结果校验抑制旧结果；归档时清理余额状态。
 - session 解析：`persistence` 解析结果缓存 120s，未找到 session 时只缓存 4s。每个 session 文件只读增量，reader 上限 200（LRU），调用明细在内存中保留最近 400 条，累计总量不受影响。
 
 ## 开发与验证
@@ -117,12 +116,16 @@ npm install
 npm run typecheck
 # 验证本项目的解析、展示和余额逻辑（显式指定测试文件）
 npm run test -- --exclude 'plugins/**' server/sessionFile.test.ts server/resolve.test.ts shared/format.test.ts shared/balanceFormat.test.ts server/balanceProbe.test.ts server/balanceService.test.ts client/pills.test.ts client/panel.test.tsx
+# 本次余额与 popover 定向验证
+npm exec -- vitest run client/pills.test.ts client/pillBalanceDiagnostics.test.ts client/panel.test.tsx client/pillBalanceIcon.test.tsx --exclude 'plugins/**'
 paseo plugin reload paseo-pi-usage
 paseo plugin ls
 paseo plugin logs paseo-pi-usage
 ```
 
-手动检查：Pi 会话 pill 显示余额与上下文占比；悬停查看明细；点击检查三张卡片顺序、余额 / 总额与进度条；确认零余额仍显示、总额缺失不显示余额进度条；点击刷新并切换会话或模型，确认旧余额不会覆盖新结果。
+手动检查：Pi 会话 pill 在小于 600px 的视口显示余额，宽屏显示余额与上下文占比；悬停查看明细；点击检查总 token 数字及完整整数值、上下文和余额状态区、细进度条及无边框展开布局；确认零余额仍显示、总额缺失不显示余额进度条；点击刷新并切换会话或模型，确认旧余额不会覆盖新结果。
+
+本次完成状态：B 方案已由用户真机确认手机显示余额；C popover 布局已通过测试与审查，但尚无用户真机视觉确认，不据此声称全平台视觉均已验证。
 
 原有验证记录：
 
@@ -134,5 +137,5 @@ paseo plugin logs paseo-pi-usage
 
 - 只统计 `provider === "pi"` 的 agent；其他 provider 不显示 pill。
 - Pi session 文件是追加写的树结构，本插件按文件线性顺序聚合，与 Pi footer 的累计口径相同。会话 rewind 或分叉后，分支上的重复条目会一并计入。
-- 会话花费来自 Pi 写入 JSONL 的 `usage.cost`，插件只求和，不自行计算模型价格；无单价的模型可能记录为 0。该统计与账户余额是两个独立来源，当前卡片、按模型拆分与调用列表不展示会话花费，tooltip 在花费大于 0 时保留摘要。
+- 会话花费来自 Pi 写入 JSONL 的 `usage.cost`，插件只求和，不自行计算模型价格；无单价的模型可能记录为 0。该统计与账户余额是两个独立来源，当前弹窗、按模型拆分与调用列表不展示会话花费，tooltip 在花费大于 0 时保留摘要。
 - 上下文窗口大小来自 Paseo 的 `lastUsage.contextWindowMaxTokens`，缺失时回退到 `providers.listModels`，两者都拿不到就显示 `?`。

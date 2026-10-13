@@ -1,7 +1,7 @@
 import type { PluginButtonContentProps, PluginHostProps } from "@getpaseo/plugin/client";
 import { useAgent, useRpc } from "@getpaseo/plugin/client";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import { formatPercent, formatTokens, sessionCacheHitRate } from "../shared/format";
 import type { CallUsage, ModelUsage, UsageSnapshot } from "../shared/usage";
@@ -9,6 +9,7 @@ import { piUsageCallsRpc, piUsageSnapshotRpc } from "../shared/usage";
 
 import { piBalanceRpc, type PiBalance } from "../shared/balance";
 import { formatBalance } from "../shared/balanceFormat";
+import { PILL_BALANCE_DIAGNOSTIC_VERSION, formatPillBalanceDiagnostic, getPillBalanceDiagnostic, subscribePillBalanceDiagnostic } from "./pillBalanceDiagnostics";
 
 const CALL_LIMIT = 40;
 
@@ -82,6 +83,19 @@ function TokenUsageView({
   const refreshBalance = useRef(false);
   const agent = useAgent(agentId, ({ status, title, provider, model }) => ({ status, title, provider, model }));
   const styles = useMemo(() => createStyles(colors, compact), [colors, compact]);
+
+  const diagnosticStore = useMemo(() => ({
+    subscribe: (listener: () => void) => subscribePillBalanceDiagnostic(agentId, listener),
+    getSnapshot: () => getPillBalanceDiagnostic(agentId),
+  }), [agentId]);
+  const pillDiagnostic = useSyncExternalStore(diagnosticStore.subscribe, diagnosticStore.getSnapshot, diagnosticStore.getSnapshot);
+  const [diagnosticClock, setDiagnosticClock] = useState(() => ({ agentId, openedAt: Date.now(), now: Date.now() }));
+  useEffect(() => {
+    const openedAt = Date.now();
+    setDiagnosticClock({ agentId, openedAt, now: openedAt });
+    const timer = setInterval(() => setDiagnosticClock({ agentId, openedAt, now: Date.now() }), 1000);
+    return () => clearInterval(timer);
+  }, [agentId]);
 
   const intervalMs = agent?.status === "running" ? 2000 : 10_000;
 
@@ -195,6 +209,12 @@ function TokenUsageView({
             </Text>
           </View>
         ) : null}
+        {pillDiagnostic ? !pillDiagnostic.hasBalance ? (
+          <Text selectable style={styles.muted}>{formatPillBalanceDiagnostic(pillDiagnostic, diagnosticClock.now)}</Text>
+        ) : null : balanceQuery.isError || formatBalance(balanceQuery.data ?? null) === null
+          || diagnosticClock.agentId !== agentId || diagnosticClock.now - diagnosticClock.openedAt < 12_000 ? (
+          <Text selectable style={styles.muted}>{`${PILL_BALANCE_DIAGNOSTIC_VERSION}；pill状态未注册（临时）`}</Text>
+        ) : null}
       </ScrollView>
     </View>
   );
@@ -214,9 +234,8 @@ function SnapshotBody({ snapshot, balance, styles, colors }: { snapshot: UsageSn
   const percent = snapshot.contextPercent;
   const barColor =
     percent === null ? colors.accent : percent > 90 ? colors.statusDanger : percent > 70 ? colors.statusWarning : colors.accent;
-  const contextDetail = snapshot.contextStale
-    ? `压缩后待更新 · 已用 ${formatTokens(snapshot.contextUsedTokens)}`
-    : `${formatTokens(snapshot.contextUsedTokens)}${snapshot.contextWindowTokens ? ` / ${formatTokens(snapshot.contextWindowTokens)}` : ""}`;
+  const contextWindow = snapshot.contextWindowTokens ? formatTokens(snapshot.contextWindowTokens) : "窗口未知";
+  const contextDetail = `${snapshot.contextStale ? "压缩后待更新 · " : ""}已用 ${formatTokens(snapshot.contextUsedTokens)} / ${contextWindow}`;
   const sessionRate = sessionCacheHitRate(snapshot.totals);
   const balanceText = formatBalance(balance) ?? "?";
   const total = balance?.total;
@@ -227,16 +246,23 @@ function SnapshotBody({ snapshot, balance, styles, colors }: { snapshot: UsageSn
 
   return (
     <>
-      <View style={styles.cardRow}>
-        <StatCard styles={styles} label="总 token" value={formatTokens(snapshot.totalTokens)} detail={groupDigits(snapshot.totalTokens)} />
-        <StatCard
+      <View style={styles.overview}>
+        <View style={styles.tokenOverview}>
+          <View style={styles.overviewHeading}>
+            <Text style={styles.overviewLabel}>总 token</Text>
+            <Text style={styles.overviewValue}>{formatTokens(snapshot.totalTokens)}</Text>
+          </View>
+          <Text style={styles.overviewDetail}>{groupDigits(snapshot.totalTokens)}</Text>
+        </View>
+        <UsageStatus
           styles={styles}
           label="上下文"
           value={percent === null ? "?" : `${formatPercent(percent)}%`}
-          detail={snapshot.contextWindowTokens || snapshot.contextUsedTokens ? contextDetail : "窗口未知"}
-          bar={percent === null ? undefined : { percent, color: barColor }}
+          detail={contextDetail}
+          inlineDetail
+          bar={percent === null || !snapshot.contextWindowTokens ? undefined : { percent, color: barColor }}
         />
-        <StatCard styles={styles} label="余额" value={balanceText} detail={`${balanceText} / ${totalText}`}
+        <UsageStatus styles={styles} label="余额" value={balanceText} detail={`${balanceText} / ${totalText}`}
           bar={remainingPercent === null ? undefined : { percent: remainingPercent, color: colors.accent }} />
       </View>
 
@@ -335,33 +361,34 @@ function CallsTable({
   );
 }
 
-function StatCard({
+function UsageStatus({
   styles,
   label,
   value,
   detail,
+  inlineDetail,
   bar,
 }: {
   styles: Styles;
   label: string;
   value: string;
-  detail?: string;
+  detail: string;
+  inlineDetail?: boolean;
   bar?: { percent: number; color: string };
 }) {
   return (
-    <View style={styles.card}>
-      <Text style={styles.cardLabel}>{label}</Text>
-      <Text style={styles.cardValue}>{value}</Text>
-      {detail ? (
-        <Text numberOfLines={1} style={styles.cardDetail}>
-          {detail}
-        </Text>
-      ) : null}
+    <View style={styles.usageStatus}>
+      <View style={styles.overviewHeading}>
+        <Text style={styles.overviewLabel}>{label}</Text>
+        <Text style={styles.overviewValue}>{value}</Text>
+        {inlineDetail ? <Text style={styles.overviewDetail}>{detail}</Text> : null}
+      </View>
+      {!inlineDetail ? <Text style={styles.overviewDetail}>{detail}</Text> : null}
       {bar ? (
-        <View style={styles.cardBarTrack}>
+        <View style={styles.statusBarTrack}>
           <View
             style={[
-              styles.cardBarFill,
+              styles.statusBarFill,
               { width: `${Math.max(0, Math.min(100, bar.percent))}%`, backgroundColor: bar.color },
             ]}
           />
@@ -397,21 +424,27 @@ function createStyles(colors: ThemeColors, compact: boolean) {
     refreshText: { color: colors.foreground, fontSize: 12 },
     muted: { color: colors.foregroundMuted, fontSize: 13, lineHeight: 20 },
     mono: { color: colors.foregroundMuted, fontSize: 11, lineHeight: 16 },
-    cardRow: { flexDirection: "row" as const, gap: compact ? 8 : 10 },
-    card: {
-      flex: 1,
-      gap: 2,
-      padding: compact ? 10 : 12,
-      borderRadius: 10,
-      borderWidth: 1,
-      borderColor: colors.border,
-      backgroundColor: colors.surface1,
+    overview: { gap: 8 },
+    tokenOverview: { gap: 2, paddingBottom: 8, borderBottomWidth: 1, borderBottomColor: colors.border },
+    usageStatus: { gap: 3 },
+    overviewHeading: {
+      flexDirection: "row" as const,
+      flexWrap: "wrap" as const,
+      alignItems: "baseline" as const,
+      columnGap: 8,
+      rowGap: 2,
     },
-    cardLabel: { color: colors.foregroundMuted, fontSize: 11 },
-    cardValue: { color: colors.foreground, fontSize: compact ? 18 : 20, fontWeight: "600" as const },
-    cardDetail: { color: colors.foregroundMuted, fontSize: 11 },
-    cardBarTrack: { height: 4, borderRadius: 2, backgroundColor: colors.surface2, overflow: "hidden" as const, marginTop: 6 },
-    cardBarFill: { height: 4, borderRadius: 2 },
+    overviewLabel: { color: colors.foregroundMuted, fontSize: 13 },
+    overviewValue: {
+      color: colors.foreground,
+      fontSize: compact ? 18 : 20,
+      fontWeight: "600" as const,
+      flexShrink: 1,
+      maxWidth: "100%" as const,
+    },
+    overviewDetail: { color: colors.foregroundMuted, fontSize: 12, lineHeight: 18, flexShrink: 1, maxWidth: "100%" as const },
+    statusBarTrack: { height: 3, borderRadius: 2, backgroundColor: colors.surface2, overflow: "hidden" as const },
+    statusBarFill: { height: 3, borderRadius: 2 },
     section: { gap: 6, paddingTop: 4 },
     sectionTitle: { color: colors.foreground, fontSize: 13, fontWeight: "600" as const, marginBottom: 2 },
     row: { flexDirection: "row" as const, alignItems: "center" as const, gap: 12 },

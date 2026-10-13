@@ -25,6 +25,7 @@ vi.mock("react-native", () => ({
 }));
 
 import { PiUsagePopover } from "./panel";
+import { createPillBalanceDiagnostic } from "./pillBalanceDiagnostics";
 import type { UsageSnapshot } from "../shared/usage";
 
 const theme = {
@@ -164,7 +165,7 @@ test("renders cumulative totals, context and per-call detail", async () => {
   expect(text).not.toContain("花费");
   for (const cost of ["$0.421", "$0.400", "$0.020", "$0.004"]) expect(text).not.toContain(cost);
   expect(text).toContain("64%"); // context percent
-  expect(text).toContain("168k / 262k");
+  expect(text).toContain("已用 168k / 262k"); // context used / window
   // Breakdown rows.
   expect(text).toContain("R 缓存读");
   expect(text).toContain("8.0M");
@@ -269,18 +270,52 @@ test("marks context unknown after a compaction like Pi does", async () => {
   await renderPopover();
   await flush();
 
-  const text = visible();
-  expect(text).toContain("压缩后待更新");
+  expect(contextStatus().findAll((node) => (node.type as unknown as string) === "Text")
+    .map((node) => node.children.join(""))).toEqual(["上下文", "?", "压缩后待更新 · 已用 168k / 262k"]);
+  expect(statusBarWidths(contextStatus())).toEqual([]);
 });
 
-
-function balanceCard() {
-  return renderer.root.find((node) => (node.type as unknown as string) === "View" && node.children.some((child) => typeof child !== "string" && (child.type as unknown as string) === "Text" && child.children.join("") === "余额"));
+function usageStatus(label: string) {
+  return renderer.root.find((node) => (node.type as unknown as string) === "Text" && node.children.join("") === label).parent!.parent!;
 }
 
+const contextStatus = () => usageStatus("上下文");
+const balanceCard = () => usageStatus("余额");
 const balanceCardText = () => balanceCard().findAll((node) => (node.type as unknown as string) === "Text").map((node) => node.children.join("")).join(" ");
-const balanceBarWidths = () => balanceCard().findAll((node) => Array.isArray(node.props.style) && node.props.style.some((style: { width?: string }) => style?.width !== undefined))
+const statusBarWidths = (status: ReturnType<typeof usageStatus>) => status.findAll((node) => Array.isArray(node.props.style) && node.props.style.some((style: { width?: string }) => style?.width !== undefined))
   .map((node) => node.props.style.find((style: { width?: string }) => style?.width !== undefined).width);
+const balanceBarWidths = () => statusBarWidths(balanceCard());
+
+test.each([
+  { used: 0, stale: false, percent: null, detail: "已用 0 / 窗口未知" },
+  { used: 167_727, stale: false, percent: 63.98, detail: "已用 168k / 窗口未知" },
+  { used: 0, stale: true, percent: null, detail: "压缩后待更新 · 已用 0 / 窗口未知" },
+])("context with unknown window keeps its full state ($detail)", async ({ used, stale, percent, detail }) => {
+  mocks.snapshot.mockResolvedValue({
+    agents: [{ ...okSnapshot, contextUsedTokens: used, contextWindowTokens: null, contextPercent: percent, contextStale: stale }],
+  });
+  await renderPopover();
+  await flush();
+  const texts = contextStatus().findAll((node) => (node.type as unknown as string) === "Text");
+  expect(texts.map((node) => node.children.join(""))).toEqual(["上下文", percent === null ? "?" : "64%", detail]);
+  expect(texts[2].props.numberOfLines).toBeUndefined();
+  expect(statusBarWidths(contextStatus())).toEqual([]);
+});
+
+test.each([true, false])("long balance values and details can wrap in compact layout %s", async (compact) => {
+  mocks.balance.mockResolvedValue({ balance: 123_456_789_012_345.67, unit: "CNY", total: 987_654_321_098_765.4 });
+  await renderPopover({ ...popoverProps, layout: { ...popoverProps.layout, compact } });
+  await flush();
+  const texts = balanceCard().findAll((node) => (node.type as unknown as string) === "Text");
+  expect(texts.map((node) => node.children.join(""))).toEqual([
+    "余额", "￥123456789012345.67", "￥123456789012345.67 / ￥987654321098765.38",
+  ]);
+  for (const node of texts.slice(1)) {
+    expect(node.props.numberOfLines).toBeUndefined();
+    expect(node.props.ellipsizeMode).toBeUndefined();
+  }
+  expect(texts[1].parent!.props.style.flexWrap).toBe("wrap");
+});
 
 test.each([[0, "0%"], [222, "44.4%"], [600, "100%"], [-10, "0%"]])("balance card clamps progress for balance %s", async (balance, width) => {
   mocks.balance.mockResolvedValue({ balance, unit: "CNY", total: 500 });
@@ -393,4 +428,76 @@ test.each(["agent", "model", "session"])("balance query clears old data when %s 
   await flush();
   expect(balanceCardText()).toContain("$10.00 / $50.00");
   expect(balanceBarWidths()).toEqual(["20%"]);
+});
+
+test("popover observes component diagnostics independently of its own balance", async () => {
+  const diagnostic = createPillBalanceDiagnostic("agent-1");
+  const other = createPillBalanceDiagnostic("agent-2");
+  try {
+    diagnostic.mount(1);
+    diagnostic.query("pending", true);
+    await renderPopover();
+    await flush();
+    expect(balanceCardText()).toContain("￥222.00");
+    expect(visible()).toContain("Icon挂载 1");
+    expect(visible()).toContain("查询中 1");
+    await act(async () => { other.publish("error", false); });
+    expect(visible()).toContain("Pill 余额诊断：pending");
+    await act(async () => { diagnostic.publish("error", false); });
+    expect(visible()).toContain("Pill 余额诊断：error");
+    await act(async () => { diagnostic.publish("success", true); });
+    expect(visible()).not.toContain("Pill 余额诊断：");
+    await act(async () => { diagnostic.dispose(); });
+    expect(visible()).not.toContain("Pill 余额诊断：");
+  } finally {
+    act(() => { diagnostic.dispose(); other.dispose(); });
+  }
+});
+
+test("popover switches component diagnostic subscription with the agent", async () => {
+  const a = createPillBalanceDiagnostic("agent-1");
+  const b = createPillBalanceDiagnostic("agent-2");
+  try {
+    a.publish("error", false);
+    b.publish("empty", false);
+    await renderPopover();
+    expect(visible()).toContain("Pill 余额诊断：error");
+    await act(async () => {
+      renderer.update(React.createElement(QueryClientProvider, { client: queryClient },
+        React.createElement(PiUsagePopover, { ...popoverProps, agentId: "agent-2" } as PluginButtonContentProps)));
+    });
+    expect(visible()).toContain("Pill 余额诊断：empty");
+    await act(async () => { a.publish("pending", false); });
+    expect(visible()).toContain("Pill 余额诊断：empty");
+    await act(async () => { b.publish("success", true); });
+    expect(visible()).not.toContain("Pill 余额诊断：");
+  } finally {
+    act(() => { a.dispose(); b.dispose(); });
+  }
+});
+
+test.each([true, false])("popover without pill store shows version and hides after 12 seconds only with normal panel balance (%s)", async (normal) => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1000);
+  if (!normal) mocks.balance.mockResolvedValue({ balance: null, unit: null });
+  try {
+    await renderPopover();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(visible()).toContain("diag-v7-query-icon；pill状态未注册");
+    await act(async () => { await vi.advanceTimersByTimeAsync(11_000); });
+    expect(visible()).toContain("pill状态未注册");
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(visible().includes("pill状态未注册")).toBe(!normal);
+    await act(async () => {
+      renderer.update(React.createElement(QueryClientProvider, { client: queryClient },
+        React.createElement(PiUsagePopover, { ...popoverProps, agentId: "agent-2" } as PluginButtonContentProps)));
+    });
+    expect(visible()).toContain("pill状态未注册");
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    act(() => { renderer.unmount(); });
+    queryClient.clear();
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
 });
