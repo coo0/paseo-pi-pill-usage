@@ -22,6 +22,12 @@ paseo plugin reload paseo-pi-usage
 paseo plugin ls
 ```
 
+## 内置工作区标记
+
+本插件已直接内置并默认启用 `paseo-workspace-writer` 的能力，不提供额外 RPC、UI 或设置。收到 `agent.created` 或 `agent.turn_started` 时，服务端会为任意 provider 在 agent 的 `cwd` 下递归创建目录，并以 UTF-8 覆写 `.paseo-workspace-id`，内容为 `workspaceId` 加一个换行；共享目录由最后一次成功处理的事件覆盖。
+
+插件不会扫描已有 agent；缺少 `cwd` 或 `workspaceId` 时跳过，写入错误会静默吞掉且不阻断 agent，后续 turn 会再次尝试。当前文档不声称已验证宿主的真实事件。用户验证内置行为后，如仍运行独立的 workspace writer 插件，应停用独立插件以避免重复写入；本项目不会自动停用它。
+
 ## 展示形式
 
 - **Composer pill**：保留在输入框上方原有的 composer track，由宿主负责确切排布，不承诺所有设备都把各元素固定在同一行。视口宽度小于 600px 时显示余额；宽屏显示余额和上下文百分比。余额保留两位小数，USD 使用 `$`，RMB / CNY 使用 `¥`；零余额也显示为 `$0.00` / `¥0.00`。余额未知显示 `—`，上下文未知或压缩后待更新显示 `?%`。
@@ -116,6 +122,8 @@ npm install
 npm run typecheck
 # 验证本项目的解析、展示和余额逻辑（显式指定测试文件）
 npm run test -- --exclude 'plugins/**' server/sessionFile.test.ts server/resolve.test.ts shared/format.test.ts shared/balanceFormat.test.ts server/balanceProbe.test.ts server/balanceService.test.ts client/pills.test.ts client/panel.test.tsx
+# 验证内置工作区标记及入口生命周期（仅使用测试临时目录）
+npm exec -- vitest run server/workspaceMarker.test.ts index.server.test.ts --exclude 'plugins/**'
 # 本次余额与 popover 定向验证
 npm exec -- vitest run client/pills.test.ts client/pillBalanceDiagnostics.test.ts client/panel.test.tsx client/pillBalanceIcon.test.tsx --exclude 'plugins/**'
 paseo plugin reload paseo-pi-usage
